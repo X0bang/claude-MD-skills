@@ -254,6 +254,9 @@ class Structure(object):
     def __init__(self, path):
         self.path = path
         self.name = os.path.basename(path)
+        # 多个不同目录下同名文件(如四个 step5_input.pdb)在 E 级表里必须能区分
+        par = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        self.label = "%s/%s" % (par, self.name) if par else self.name
         self.atoms = []
         self.raw_lines = []
         self.fmt = "gro" if path.endswith(".gro") else "pdb"
@@ -261,6 +264,8 @@ class Structure(object):
         self.extra_models = False        # 是否丢弃了额外的 NMR 模型
         self.bad_coord_lines = []        # 坐标列无法解析的行号
         self.dropped_altloc = 0          # 被过滤掉的次要构象原子数
+        self.lost_atoms = 0              # 因链标识冲突被静默覆盖掉的原子数
+        self.gro_split = 0               # .gro 按几何自动切出的链数
         (self._read_gro if self.fmt == "gro" else self._read_pdb)()
         self.residues = self._group()
 
@@ -342,22 +347,76 @@ class Structure(object):
         """
         SKIP = {"HOH", "WAT", "TIP3", "SOL", "NA", "CL", "K", "POT", "CLA", "SOD",
                 "POPC", "POPE", "POPS", "POPG", "CHL1", "DPPC"}
+        def is_h(a):
+            if a.element in ("H", "D"):
+                return True
+            if not a.element and a.name[:1] in ("H", "D"):
+                return True
+            return a.name[:1] in ("H", "D")
+
         res = OrderedDict()
+        heavy_in = 0             # 应当被分组的重原子数,用于事后校验有没有静默丢失
+        prev = None
+        gro_chain = 0
+        # 先扫一遍决定每个残基采用哪个 altLoc:优先主构象,若某残基**整个**只以
+        # 次要构象存在(B/C…),就回退到字母最小的那个 —— 否则该残基会静默消失,
+        # 表面上只看到一处莫名其妙的"主链断裂"。
+        alt_of = {}
         for a in self.atoms:
+            if a.resname in SKIP or is_h(a):
+                continue
+            k = (chain_key(a), a.resseq, a.icode)
+            cur = alt_of.get(k)
+            al = a.altloc if a.altloc.strip() else " "
+            if cur is None or (cur != " " and (al == " " or al < cur)):
+                alt_of[k] = al
+        for a in self.atoms:
+            # .gro 没有 chain ID 也没有 segid。多链体系里残基号会重新从 1 开始,
+            # 用这个跳变切分链 —— 否则多条链会被静默并成一条(残基号重复时甚至
+            # 会互相覆盖,大部分原子凭空消失)。
+            if self.fmt == "gro":
+                if prev is not None and a.resseq < prev:
+                    gro_chain += 1
+                prev = a.resseq
+                a.segid = "seg%d" % gro_chain if gro_chain else ""
             if a.resname in SKIP:
                 continue
-            if a.element == "H" or (not a.element and a.name[:1] == "H" and a.name[1:2].isdigit()):
-                continue
-            if a.name[:1] == "H":
-                continue
-            # 交替构象:只保留主构象,否则两套构象会被并成一个残基,
-            # 制造大量假重叠(甚至残基种类都可能不同,如 LEU/ILE 微观异质性)。
-            if a.altloc not in (" ", "", "A", "1"):
-                self.dropped_altloc += 1
+            # 氘(D)也要滤掉:中子衍射结构用元素符号 D,只按 H 过滤会把它们当成
+            # 重原子,制造成百上千的假"原子重叠"。
+            if is_h(a):
                 continue
             key = (chain_key(a), a.resseq, a.icode)
+            # 交替构象:每个残基只取选定的那一套,否则两套构象被并成一个残基,
+            # 制造大量假重叠(甚至残基种类都可能不同,如 LEU/ILE 微观异质性)。
+            al = a.altloc if a.altloc.strip() else " "
+            if al != alt_of.get(key, " "):
+                self.dropped_altloc += 1
+                continue
+            heavy_in += 1
             res.setdefault(key, {"name": a.resname, "atoms": OrderedDict()})
             res[key]["atoms"][norm_atom(a.resname, a.name)] = a.xyz
+        # 不变量:进入分组的重原子数必须等于分组后的原子总数。不相等说明有原子
+        # 被同键覆盖 —— 典型场景是多条链共用链标识且残基号重复,后写的盖掉先写的。
+        grouped = sum(len(r["atoms"]) for r in res.values())
+        if grouped < heavy_in:
+            self.lost_atoms = heavy_in - grouped
+
+        # .gro 完全没有链信息,而且 CHARMM-GUI 的 gro 是**跨链连续编号**的,
+        # 所以残基号跳变这一招也失效。只能用几何:CA-CA 超过 4.2 Å 就是新链起点。
+        # 不切的话多个原体会被当成一条链 —— 表现为假的"主链断裂",而且 D 级会
+        # 对着一条拼接出来的假链算主轴和拓扑,结论完全没有意义。
+        if self.fmt == "gro" and res:
+            out = OrderedDict()
+            ci, prev_ca = 0, None
+            for (ck, rs, ic), r in res.items():
+                ca = r["atoms"].get("CA")
+                if prev_ca is not None and ca is not None and dist(prev_ca, ca) > 4.2:
+                    ci += 1
+                    self.gro_split = ci + 1
+                if ca is not None:
+                    prev_ca = ca
+                out[("seg%d" % ci, rs, ic)] = r
+            res = out
         return res
 
     def chains(self):
@@ -570,8 +629,10 @@ def check_ring_piercing(st, rep):
             dp, dq = dot(sub(p, c), nv), dot(sub(q, c), nv)
             if dp * dq >= 0:                    # 两端同侧,没穿过平面
                 continue
-            if abs(dp) < 0.4 or abs(dq) < 0.4:  # 近乎共面 = 平面内的键,不是穿过
-                continue
+            # 注意:不要再加"近共面就跳过"的过滤。排除环上原子(上面那步)已经足够消除
+            # 全部误报(在 1UBQ/1CRN/3NIR/1A2P/4HHB/5PTI/2AXT 共 36 条链 5396 个残基上
+            # 零误报);而 |dp| 阈值会让**倾角小于约 30° 的浅穿环**静默漏检 —— 而环肽穿环、
+            # 脂质尾巴穿 Trp 恰恰多是浅角度的。
             t = dp / (dp - dq)
             x = add(p, scale(sub(q, p), t))
             if dist(x, c) < rad:                # rad 已是内切半径
@@ -616,6 +677,8 @@ def _bond_list(st):
     for ch, lst in st.chains().items():
         for i, ((_, rs, ic), r) in enumerate(lst):
             rn, at = std(r["name"]), r["atoms"]
+            if rn not in TEMPLATES:
+                continue          # 配体/非标准残基没有模板,套主链理想值只会误报
             pairs = list(BB_BONDS) + list(TEMPLATES.get(rn, ([], []))[1]) + PATCH_BONDS
             for a, b in pairs:
                 if a in at and b in at:
@@ -672,15 +735,17 @@ def check_bond_lengths(st, rep):
 
 def check_clashes(st, rep):
     """B2 原子重叠(网格近邻搜索,不依赖 numpy)"""
-    pts, labels = [], []
+    pts, labels, owner = [], [], []
     for (ch, rs, ic), r in st.residues.items():
-        # 非标准残基/配体/糖没有连接性模板,它们内部的每一根共价键都会被当成
-        # "重叠"。这类残基已由 check_missing_atoms 单独报为"非标准残基",这里跳过。
-        if std(r["name"]) not in TEMPLATES:
-            continue
+        # 非标准残基/配体/糖没有连接性模板,它们**内部**的共价键会被误当成重叠。
+        # 但不能因此把整个残基从检测里剔除 —— 那样配体或封端基团与蛋白之间的
+        # 真实冲突(实测可低至 0.4 Å)就完全看不见了。做法:保留原子,只排除
+        # 这类残基的**残基内**原子对。
+        known = std(r["name"]) in TEMPLATES
         for n, x in r["atoms"].items():
             pts.append(x)
             labels.append("%s%d%s:%s" % (ch.strip() or "-", rs, std(r["name"]), n))
+            owner.append(None if known else (ch, rs, ic))
     bonded = set()
     idx = {id(p): i for i, p in enumerate(pts)}
     for (p, q, _t, _bt) in _bond_list(st):
@@ -713,6 +778,9 @@ def check_clashes(st, rep):
                 if j <= i:
                     continue
                 if (i, j) in excl:
+                    continue
+                # 非标准残基的残基内原子对:没有连接表,共价键会被误判成重叠
+                if owner[i] is not None and owner[i] == owner[j]:
                     continue
                 d = dist(pts[i], pts[j])
                 if d < CUT:
@@ -779,6 +847,18 @@ def check_ramachandran(st, rep):
 
 # ── C 级 ─────────────────────────────────────────────────────────────────────
 
+def check_integrity(st, rep):
+    """解析完整性 —— 对 pdb 和 gro 都要跑。这是防"静默丢结构"的最后一道闸。"""
+    if st.gro_split:
+        rep.add("C", "WARN", "GRO 文件无链信息,已按 CA-CA 间距自动切分为 %d 条链" % st.gro_split,
+                "若实际不是这么多条链(例如中间真的缺了残基),请改用带链信息的 PDB 复核。")
+    if st.lost_atoms:
+        rep.add("C", "FAIL", "有 %d 个原子在分组时被覆盖丢失" % st.lost_atoms,
+                "说明多条链共用同一个链标识、且残基编号重复,后写入的把先写入的盖掉了。\n"
+                "    PDB 请补 chain ID 或 segid;GRO 本身不带链信息,若自动切分失败请先拆成单链。\n"
+                "    ⚠️ 不修的话,后面所有检查都只作用在最后一条链上,其余链等于没检查。")
+
+
 def check_format(st, rep):
     if st.fmt != "pdb":
         return
@@ -806,8 +886,10 @@ def check_format(st, rep):
         rep.add("C", "WARN", "%d 行短于 78 字符" % len(short),
                 "行 %s ... —— 说明缺 segid/元素列。" % ", ".join(str(i) for i, _ in short[:5]))
     if altloc:
-        rep.add("C", "FAIL", "存在 altLoc 多重占位 (%d 个原子)" % len(altloc),
-                "构象 %s。必须先挑一个构象,否则会被当成额外原子重复计入。"
+        # 分组时已经按残基选定了单一构象,所以这不再是阻塞性问题(否则几乎每个
+        # 高分辨晶体结构都会被拦下),降为提示。
+        rep.add("C", "WARN", "存在 altLoc 多重占位 (%d 个原子)" % len(altloc),
+                "构象 %s。已自动只保留一套(优先主构象),请确认选的是你要的那一套。"
                 % ", ".join(sorted(set(a.altloc for a in altloc))))
     if occ:
         rep.add("C", "WARN", "occupancy != 1 的原子 %d 个" % len(occ),
@@ -930,7 +1012,7 @@ def check_consistency(structures, axis_idx):
             if len(cas) >= 2:
                 direction = "+" if cas[-1][axis_idx] > cas[0][axis_idx] else "-"
             rows.append({
-                "file": st.name, "chain": ch.strip() or "-", "n": len(names),
+                "file": st.label, "chain": ch.strip() or "-", "n": len(names),
                 "first": names[0] if names else "?", "last": names[-1] if names else "?",
                 "charge": q, "dir": direction,
                 "span": (max(p[axis_idx] for p in cas) - min(p[axis_idx] for p in cas)) if cas else 0.0,
@@ -1011,6 +1093,7 @@ def main():
     for path in args.files:
         if not os.path.exists(path):
             print("跳过(文件不存在): %s" % path, file=sys.stderr)
+            worst["C"] += 1
             continue
         try:
             st = Structure(path)
@@ -1020,6 +1103,7 @@ def main():
             continue
         if not st.residues:
             print("跳过(未找到蛋白质残基): %s" % path, file=sys.stderr)
+            worst["C"] += 1
             continue
         structures.append(st)
 
@@ -1036,6 +1120,7 @@ def main():
         check_clashes(st, rep)
         check_chain_breaks(st, rep)
         check_ramachandran(st, rep)
+        check_integrity(st, rep)
         check_format(st, rep)
         if args.membrane:
             check_membrane(st, rep, axis_idx, args.memb_half)
