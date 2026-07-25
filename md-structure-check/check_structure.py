@@ -77,6 +77,17 @@ TEMPLATES = {
 BACKBONE = ["N", "CA", "C", "O"]
 BB_BONDS = [("N", "CA"), ("CA", "C"), ("C", "O")]
 
+# 端基封端(patch)的成键。MD 体系几乎都封端,不认这些会把封端原子误报成"原子重叠"。
+#   ACE 乙酰封端 (CHARMM): CAY-CY-OY,CY 连主链 N
+#   CT2/CT3 酰胺封端 (CHARMM): C-NT,CT3 另有 NT-CAT
+#   标准羧基端: C-OXT
+PATCH_BONDS = [("CAY", "CY"), ("CY", "OY"), ("CY", "N"),
+               ("C", "NT"), ("NT", "CAT"), ("C", "OXT"), ("CH3", "C")]
+PATCH_IDEAL = {frozenset(("CAY", "CY")): 1.52, frozenset(("CY", "OY")): 1.23,
+               frozenset(("CY", "N")): 1.35, frozenset(("C", "NT")): 1.33,
+               frozenset(("NT", "CAT")): 1.45, frozenset(("C", "OXT")): 1.25,
+               frozenset(("CH3", "C")): 1.52}
+
 # CHARMM / AMBER 常见残基名别名 -> 标准名
 ALIASES = {"HSD": "HIS", "HSE": "HIS", "HSP": "HIS", "HID": "HIS", "HIE": "HIS",
            "HIP": "HIS", "CYX": "CYS", "CYM": "CYS", "ASH": "ASP", "GLH": "GLU",
@@ -514,7 +525,7 @@ def _bond_list(st):
     for ch, lst in st.chains().items():
         for i, ((_, rs, ic), r) in enumerate(lst):
             rn, at = std(r["name"]), r["atoms"]
-            pairs = list(BB_BONDS) + list(TEMPLATES.get(rn, ([], []))[1])
+            pairs = list(BB_BONDS) + list(TEMPLATES.get(rn, ([], []))[1]) + PATCH_BONDS
             for a, b in pairs:
                 if a in at and b in at:
                     out.append((at[a], at[b],
@@ -537,7 +548,9 @@ def check_bond_lengths(st, rep):
         if rn == "*PEP*":
             ideal = PEPTIDE_CN
         else:
-            ideal = IDEAL_SC.get((rn, frozenset((a, b))))
+            ideal = PATCH_IDEAL.get(frozenset((a, b)))
+            if ideal is None:
+                ideal = IDEAL_SC.get((rn, frozenset((a, b))))
             if ideal is None:
                 ideal = IDEAL_BONDS.get((a, b), IDEAL_BONDS.get((b, a)))
             if ideal is None:
