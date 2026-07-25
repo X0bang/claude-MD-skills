@@ -82,7 +82,8 @@ BB_BONDS = [("N", "CA"), ("CA", "C"), ("C", "O")]
 #   CT2/CT3 酰胺封端 (CHARMM): C-NT,CT3 另有 NT-CAT
 #   标准羧基端: C-OXT
 PATCH_BONDS = [("CAY", "CY"), ("CY", "OY"), ("CY", "N"),
-               ("C", "NT"), ("NT", "CAT"), ("C", "OXT"), ("CH3", "C")]
+               ("C", "NT"), ("NT", "CAT"), ("C", "OXT"),
+               ("CH3", "C"), ("N", "CH3")]      # AMBER: ACE 的 CH3-C,NME 的 N-CH3
 PATCH_IDEAL = {frozenset(("CAY", "CY")): 1.52, frozenset(("CY", "OY")): 1.23,
                frozenset(("CY", "N")): 1.35, frozenset(("C", "NT")): 1.33,
                frozenset(("NT", "CAT")): 1.45, frozenset(("C", "OXT")): 1.25,
@@ -96,8 +97,10 @@ ALIASES = {"HSD": "HIS", "HSE": "HIS", "HSP": "HIS", "HID": "HIS", "HIE": "HIS",
 # 原子名别名:CHARMM 与 PDB 标准的差异。不归一化会把"命名不同"误报成"缺原子"。
 #   ILE 的 δ 碳:CHARMM 叫 CD,PDB 标准叫 CD1
 #   C 端羧基氧:CHARMM 叫 OT1/OT2,PDB 标准叫 O/OXT
+#   硒代甲硫氨酸 MSE:硫位上是硒,原子名 SE(归一化成 MET 后模板要的是 SD)
 ATOM_ALIASES = {
     "ILE": {"CD": "CD1"},
+    "MET": {"SE": "SD"},          # MSE -> MET 之后 SE 要映射成 SD
     "*":   {"OT1": "O", "OT2": "OXT", "O1": "O", "O2": "OXT"},
 }
 
@@ -106,7 +109,17 @@ def norm_atom(resname, atom):
     rn = ALIASES.get(resname, resname)
     return ATOM_ALIASES.get(rn, {}).get(atom, ATOM_ALIASES["*"].get(atom, atom))
 
-CHARGE = {"ARG": +1, "LYS": +1, "ASP": -1, "GLU": -1, "HSP": +1, "HIP": +1}
+# 侧链净电荷。必须用**原始残基名**查表 —— 先经 std() 归一化会把 HSP/ASH/LYN 等
+# 质子化态信息抹掉,导致电荷算错(HSP 会变成 HIS 而得到 0 而非 +1)。
+CHARGE = {"ARG": +1, "LYS": +1, "ASP": -1, "GLU": -1,
+          "HSP": +1, "HIP": +1,                      # 双质子化 His
+          "ASH": 0, "GLH": 0, "LYN": 0, "CYM": -1}   # 非标准质子化态
+
+
+def res_charge(raw_name):
+    if raw_name in CHARGE:
+        return CHARGE[raw_name]
+    return CHARGE.get(std(raw_name), 0)
 
 # 理想键长 (Å) 与容差
 IDEAL_BONDS = {("N", "CA"): 1.458, ("CA", "C"): 1.525, ("C", "O"): 1.231}
@@ -186,29 +199,37 @@ def dihedral(p0, p1, p2, p3):
     x, y = dot(v, w), dot(cross(b1u, v), w)
     return math.degrees(math.atan2(y, x))
 
+def _best_normal(pts, c=None):
+    """最佳拟合平面的法向 = 协方差矩阵最小特征值对应的特征向量。
+
+    直接对 (trace(M)·I − M) 做幂迭代:它的最大特征向量正是 M 的最小特征向量。
+    这样避开了"先求最大、再正交去除两次"的做法 —— 后者在**完全对称的共面点集**
+    (理想正 n 边形)上会遇到 λ1 = λ2 的简并,去除后残量精确为零,只能退回一个
+    硬编码方向,算出来的"离面量"其实是环的面内展宽,导致平面性误报。
+    """
+    n = len(pts)
+    if c is None:
+        c = scale((sum(p[0] for p in pts), sum(p[1] for p in pts),
+                   sum(p[2] for p in pts)), 1.0/n)
+    q = [sub(p, c) for p in pts]
+    M = [[sum(v[i]*v[j] for v in q) for j in range(3)] for i in range(3)]
+    tr = M[0][0] + M[1][1] + M[2][2]
+    N = [[(tr if i == j else 0.0) - M[i][j] for j in range(3)] for i in range(3)]
+    v = (0.5773, 0.5774, 0.5775)
+    for _ in range(200):
+        w = tuple(sum(N[i][j]*v[j] for j in range(3)) for i in range(3))
+        if norm(w) < 1e-15:
+            break
+        v = unit(w)
+    return v
+
+
 def plane_rmsd(pts):
-    """点集到最佳拟合平面的 RMSD —— 用幂迭代求最小惯量主轴,无需 numpy"""
+    """点集到最佳拟合平面的 RMSD"""
     n = len(pts)
     c = scale((sum(p[0] for p in pts), sum(p[1] for p in pts), sum(p[2] for p in pts)), 1.0/n)
-    q = [sub(p, c) for p in pts]
-    # 协方差矩阵
-    M = [[sum(v[i]*v[j] for v in q) for j in range(3)] for i in range(3)]
-    # 求最大特征值对应向量,再做两次正交去除 -> 剩下的是法向
-    def mul(m, v): return tuple(sum(m[i][j]*v[j] for j in range(3)) for i in range(3))
-    def top_vec(m, exclude):
-        v = (0.5773, 0.5774, 0.5775)
-        for _ in range(60):
-            for e in exclude:
-                v = sub(v, scale(e, dot(v, e)))
-            v = unit(mul(m, v))
-            if norm(v) < 1e-9: return (0.0, 0.0, 1.0)
-        for e in exclude:
-            v = unit(sub(v, scale(e, dot(v, e))))
-        return v
-    e1 = top_vec(M, [])
-    e2 = top_vec(M, [e1])
-    nrm = unit(cross(e1, e2))
-    return math.sqrt(sum(dot(v, nrm)**2 for v in q) / n)
+    nrm = _best_normal(pts, c)
+    return math.sqrt(sum(dot(sub(p, c), nrm)**2 for p in pts) / n)
 
 def principal_axis(pts):
     """最大惯量主轴(幂迭代)"""
@@ -237,14 +258,27 @@ class Structure(object):
         self.raw_lines = []
         self.fmt = "gro" if path.endswith(".gro") else "pdb"
         self.has_hydrogen = False
+        self.extra_models = False        # 是否丢弃了额外的 NMR 模型
+        self.bad_coord_lines = []        # 坐标列无法解析的行号
+        self.dropped_altloc = 0          # 被过滤掉的次要构象原子数
         (self._read_gro if self.fmt == "gro" else self._read_pdb)()
         self.residues = self._group()
 
     def _read_pdb(self):
+        model = 0
         with open(self.path) as fh:
             for i, line in enumerate(fh, 1):
                 line = line.rstrip("\n")
                 self.raw_lines.append((i, line))
+                # 多模型(NMR ensemble):只取第一个模型。不处理的话后面的模型会
+                # 覆盖前面的坐标,并制造满屏假"重复原子"。
+                if line.startswith("MODEL"):
+                    model += 1
+                    if model > 1:
+                        self.extra_models = True
+                    continue
+                if model > 1:
+                    continue
                 if not line.startswith(("ATOM", "HETATM")):
                     continue
                 a = Atom()
@@ -263,7 +297,13 @@ class Structure(object):
                 except ValueError:
                     a.resseq = -9999
                 a.icode = pad[26]
-                a.xyz = (float(pad[30:38]), float(pad[38:46]), float(pad[46:54]))
+                try:
+                    a.xyz = (float(pad[30:38]), float(pad[38:46]), float(pad[46:54]))
+                except ValueError:
+                    # 坐标列被截断或溢出(如 -1234.567 占 9 列)。记下行号继续,
+                    # 而不是让整个文件解析失败。
+                    self.bad_coord_lines.append(i)
+                    continue
                 a.occ  = _f(pad[54:60], 1.0)
                 a.bfac = _f(pad[60:66], 0.0)
                 a.segid   = pad[72:76].strip()
@@ -293,7 +333,13 @@ class Structure(object):
             self.atoms.append(a)
 
     def _group(self):
-        """按 (chain, resseq, icode) 分组;跳过氢和水/离子/脂质"""
+        """按 (链标识, resseq, icode) 分组;跳过氢和水/离子/脂质
+
+        ⚠️ 链标识必须同时看 chain ID 和 segid。CHARMM / CHARMM-GUI / psfgen 风格的
+           文件里,多条链的 chain ID 可能全都一样(甚至为空),真正区分它们的是
+           73-76 列的 segid。只按 chain ID 分组会把多个原体**静默合并**成一条链 ——
+           后写入的覆盖先写入的,大部分结构凭空消失,而且会伪造出满屏"重复原子"。
+        """
         SKIP = {"HOH", "WAT", "TIP3", "SOL", "NA", "CL", "K", "POT", "CLA", "SOD",
                 "POPC", "POPE", "POPS", "POPG", "CHL1", "DPPC"}
         res = OrderedDict()
@@ -304,7 +350,12 @@ class Structure(object):
                 continue
             if a.name[:1] == "H":
                 continue
-            key = (a.chain, a.resseq, a.icode)
+            # 交替构象:只保留主构象,否则两套构象会被并成一个残基,
+            # 制造大量假重叠(甚至残基种类都可能不同,如 LEU/ILE 微观异质性)。
+            if a.altloc not in (" ", "", "A", "1"):
+                self.dropped_altloc += 1
+                continue
+            key = (chain_key(a), a.resseq, a.icode)
             res.setdefault(key, {"name": a.resname, "atoms": OrderedDict()})
             res[key]["atoms"][norm_atom(a.resname, a.name)] = a.xyz
         return res
@@ -325,6 +376,15 @@ def _f(s, d):
 
 def std(resname):
     return ALIASES.get(resname, resname)
+
+
+def chain_key(a):
+    """链标识 = chain ID + segid。两处(分组、重复原子检测)必须用同一套判据,
+    否则 CHARMM 风格文件里靠 segid 区分的多条链会被当成同一条。"""
+    ck = a.chain.strip()
+    if a.segid:
+        return "%s:%s" % (ck, a.segid) if ck else a.segid
+    return ck
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -439,7 +499,9 @@ def check_missing_atoms(st, rep):
         want = set(BACKBONE) | set(TEMPLATES[rn][0])
         have = set(r["atoms"])
         lack = want - have
-        lack.discard("O")                      # C 端 O 可能叫 OT1/OXT
+        # 注意:不要无条件丢弃 "O"。C 端的 OT1/O1 已由 ATOM_ALIASES 归一化成 O,
+        # 所以这里缺 O 就是真的缺主链羰基氧 —— 那是 A 级问题(补出来的 O 方向由
+        # φ/ψ 决定,可能完全错),必须报出来。
         if lack:
             missing.append("%s%d%s 缺 %s" % (ch.strip() or "-", rs, rn, ",".join(sorted(lack))))
     if missing:
@@ -484,8 +546,14 @@ def check_ring_piercing(st, rep):
             if len(pts) == len(ring):
                 c = scale((sum(p[0] for p in pts), sum(p[1] for p in pts),
                            sum(p[2] for p in pts)), 1.0/len(pts))
-                nv = unit(cross(sub(pts[0], c), sub(pts[2], c)))
-                rad = max(dist(p, c) for p in pts)
+                # 法向用最佳拟合平面,不用三点叉积 —— 三点法会给环上原子随机的
+                # 微小离面量,让"两端异侧"频繁假成立。
+                nv = _best_normal(pts, c)
+                # "在环内"的判据要用内切半径(apothem),不是外接半径。
+                # 正 n 边形 apothem/外接 = cos(π/n):六元环 0.866、五元环 0.809。
+                # 原先硬编码的 0.85 大于五元环的 0.809,任何五元环的边都会被误判。
+                mean_rad = sum(dist(p, c) for p in pts) / len(pts)
+                rad = mean_rad * math.cos(math.pi / len(ring))
                 rings.append((ch, rs, rn, c, nv, rad, set(id(p) for p in pts), pts))
 
     bonds = _bond_list(st)
@@ -506,7 +574,7 @@ def check_ring_piercing(st, rep):
                 continue
             t = dp / (dp - dq)
             x = add(p, scale(sub(q, p), t))
-            if dist(x, c) < rad * 0.85:
+            if dist(x, c) < rad:                # rad 已是内切半径
                 hits.append("%s 环 %s%d%s 被 %s 穿过" % ("", ch.strip() or "-", rs, rn, tag))
     if hits:
         rep.add("A", "FAIL", "穿环 %d 处" % len(hits),
@@ -559,6 +627,17 @@ def _bond_list(st):
                     out.append((at["C"], nxt["N"],
                                 "%s%d-%d 肽键 C-N" % (ch.strip() or "-", rs, lst[i+1][0][1]),
                                 ("*PEP*", "C", "N")))
+    # 二硫键也是共价键 —— 不加进键表的话,check_clashes 会把每一对二硫键
+    # 都报成"原子重叠"(SG-SG 约 2.03 Å,低于 2.2 Å 截断)。
+    sgs = [((ck, rs), r["atoms"]["SG"]) for (ck, rs, ic), r in st.residues.items()
+           if std(r["name"]) == "CYS" and "SG" in r["atoms"]]
+    for i in range(len(sgs)):
+        for j in range(i + 1, len(sgs)):
+            if dist(sgs[i][1], sgs[j][1]) < 2.5:
+                out.append((sgs[i][1], sgs[j][1],
+                            "%s%d-%s%d 二硫键 SG-SG" % (sgs[i][0][0] or "-", sgs[i][0][1],
+                                                     sgs[j][0][0] or "-", sgs[j][0][1]),
+                            ("*SS*", "SG", "SG")))
     return out
 
 
@@ -570,6 +649,8 @@ def check_bond_lengths(st, rep):
         tol = BOND_TOL
         if rn == "*PEP*":
             ideal = PEPTIDE_CN
+        elif rn == "*SS*":
+            ideal, tol = 2.03, 0.20          # 二硫键
         else:
             ideal = PATCH_IDEAL.get(frozenset((a, b)))
             if ideal is None:
@@ -593,6 +674,10 @@ def check_clashes(st, rep):
     """B2 原子重叠(网格近邻搜索,不依赖 numpy)"""
     pts, labels = [], []
     for (ch, rs, ic), r in st.residues.items():
+        # 非标准残基/配体/糖没有连接性模板,它们内部的每一根共价键都会被当成
+        # "重叠"。这类残基已由 check_missing_atoms 单独报为"非标准残基",这里跳过。
+        if std(r["name"]) not in TEMPLATES:
+            continue
         for n, x in r["atoms"].items():
             pts.append(x)
             labels.append("%s%d%s:%s" % (ch.strip() or "-", rs, std(r["name"]), n))
@@ -675,6 +760,9 @@ def check_ramachandran(st, rep):
                 continue
             if not all(k in a1 for k in ("N", "CA", "C")) or "C" not in a0 or "N" not in a2:
                 continue
+            # 断链两侧算出的 φ/ψ 没有意义,先确认前后确实通过肽键相连
+            if dist(a0["C"], a1["N"]) > 2.0 or dist(a1["C"], a2["N"]) > 2.0:
+                continue
             phi = dihedral(a0["C"], a1["N"], a1["CA"], a1["C"])
             psi = dihedral(a1["N"], a1["CA"], a1["C"], a2["N"])
             ok = ((-180 <= phi <= -20 and (-90 <= psi <= 60 or 90 <= psi <= 180 or psi <= -150))
@@ -733,12 +821,25 @@ def check_format(st, rep):
     dup = []
     seen = defaultdict(set)
     for a in st.atoms:
-        key = (a.chain, a.resseq, a.icode)
-        if a.name in seen[key] and a.altloc in (" ", "A"):
-            dup.append("%s%d:%s" % (a.chain.strip() or "-", a.resseq, a.name))
+        if a.altloc not in (" ", "", "A", "1"):
+            continue                      # 次要构象本就重名,不算重复
+        key = (chain_key(a), a.resseq, a.icode)
+        if a.name in seen[key]:
+            dup.append("%s%d:%s" % (chain_key(a) or "-", a.resseq, a.name))
         seen[key].add(a.name)
     if dup:
         rep.add("C", "FAIL", "重复原子 %d 个" % len(dup), ", ".join(dup[:10]))
+
+    if st.extra_models:
+        rep.add("C", "WARN", "文件含多个 MODEL(NMR ensemble),只检查了第一个模型",
+                "若要检查其他模型,请先拆分文件。")
+    if st.bad_coord_lines:
+        rep.add("C", "FAIL", "坐标列无法解析的行 %d 行" % len(st.bad_coord_lines),
+                "行 %s。多为坐标溢出(如 -1234.567 占满 9 列)或行被截断,这些原子已被丢弃。"
+                % ", ".join(str(i) for i in st.bad_coord_lines[:8]))
+    if st.dropped_altloc:
+        rep.add("C", "WARN", "已丢弃次要构象原子 %d 个" % st.dropped_altloc,
+                "只保留了主构象(altLoc 为空或 A)。请确认这是你想要的那一个。")
 
     has_end = any(l.startswith("END") for _, l in st.raw_lines)
     if not has_end:
@@ -824,7 +925,7 @@ def check_consistency(structures, axis_idx):
         for ch, lst in st.chains().items():
             names = [std(r["name"]) for _, r in lst]
             cas = [r["atoms"]["CA"] for _, r in lst if "CA" in r["atoms"]]
-            q = sum(CHARGE.get(n, 0) for n in names)
+            q = sum(res_charge(r["name"]) for _, r in lst)     # 用原始残基名,保留质子化态
             direction = "?"
             if len(cas) >= 2:
                 direction = "+" if cas[-1][axis_idx] > cas[0][axis_idx] else "-"
@@ -834,10 +935,14 @@ def check_consistency(structures, axis_idx):
                 "charge": q, "dir": direction,
                 "span": (max(p[axis_idx] for p in cas) - min(p[axis_idx] for p in cas)) if cas else 0.0,
             })
-    dirs = set(r["dir"] for r in rows)
+    # "?" 表示该链太短、无法判定朝向,不能当成"第三种朝向"参与比较,
+    # 否则任何含短链/纯 HETATM 链的文件都会被误报成"朝向不一致"。
+    dirs = set(r["dir"] for r in rows if r["dir"] != "?")
     if len(dirs) > 1:
         grp = defaultdict(list)
         for r in rows:
+            if r["dir"] == "?":
+                continue
             grp[r["dir"]].append("%s:%s" % (r["file"], r["chain"]))
         issues.append(("FAIL", "拓扑朝向不一致",
                        "  ".join("%s -> %s" % (k, ", ".join(v)) for k, v in grp.items()) +
@@ -873,7 +978,10 @@ def print_report(rep, quiet):
         items = rep.items.get(tier)
         if not items:
             continue
-        shown = [x for x in items if not (quiet and x[0] == "PASS")]
+        # D 级(膜蛋白)全部用 PASS 发出,但它们本质是"需人工确认的事实",不是通过项。
+        # --quiet 下若一并隐藏,倾角/拓扑朝向/疏水失配/positive-inside 就全看不到了 ——
+        # 而那恰恰是这个工具最需要人过目的部分。
+        shown = [x for x in items if not (quiet and x[0] == "PASS" and tier != "D")]
         if not shown:
             continue
         print("\n%s" % title)
@@ -962,6 +1070,12 @@ def main():
 
     # ── 总结 ──
     print("\n" + "=" * 78)
+    if not structures:
+        # "没东西可检"和"检过没问题"必须给不同的结论和退出码,
+        # 否则接进流水线时会静默放行。
+        print("  ✗ 没有成功解析出任何蛋白质结构 —— 这不等于检查通过。")
+        print("=" * 78 + "\n")
+        return 2
     if worst["A"] == 0 and worst["C"] == 0:
         print("  结论:未发现阻塞性问题,可以进入建模。")
     else:
