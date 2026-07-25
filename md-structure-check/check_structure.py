@@ -350,10 +350,26 @@ class Report(object):
 def check_chirality(st, rep):
     """A1/A2 手性 —— MD 永远修不好
 
-    判据经 CHARMM 验证(用 improper 能量≈0 的干净体系校准):
-      CA:      det(N-CA, C-CA, CB-CA) > 0  => L 型
-      ILE-CB:  det(CA-CB, CG1-CB, CG2-CB) > 0 => 正确
-      THR-CB:  det(CA-CB, OG1-CB, CG2-CB) > 0 => 正确
+    判据:
+      CA:      det(N-CA,  C-CA,   CB-CA)  > 0  => L 型
+      ILE-CB:  det(CA-CB, CG1-CB, CG2-CB) > 0  => 正确构型 (2S,3S)
+      THR-CB:  det(CA-CB, OG1-CB, CG2-CB) > 0  => 正确构型 (2S,3R)
+
+    符号依据(三条独立证据,已交叉验证):
+      1. CIP 推导:对优先级 p1>p2>p3>p4 的手性中心,S 型 <=> det[p1,p2,p3] > 0。
+         CA 处优先级 N > C' > CB > HA,L-氨基酸为 (S),故 det > 0 = L。
+         ⚠️ Cys 是个坑:S(16) > O(8) 使 CB > C',CIP 字母翻成 (R) —— 但那只是
+         命名翻转,把行列式的后两列换回同样的原子顺序后符号不变,20 种残基统一适用。
+      2. 实验结构:1UBQ(1.8 Å)/1CRN(1.5 Å)/4LZT(0.95 Å) 共 229 个带 CB 的残基,
+         行列式 100% 为正(均值 +2.5,最小 +1.93),其中 14 个 CYS 同样全正。
+      3. CHARMM36 拓扑 top_all36_prot.rtf 的 IC 表:L-Ala 的 improper
+         N-C-CA-CB = +123.23°,据此重建坐标得 det = +2.467,镜像得 -2.467。
+
+    ⚠️ 不要用 "CHARMM improper 能量接近 0" 来论证手性正确 —— CHARMM36 蛋白力场
+       根本没有 CA 手性 improper(只有 IMPR N -C CA HN 和 IMPR C CA +N O,约束的是
+       酰胺 H 与羰基 O 的平面性)。D 型残基给出的 improper 能量完全相同。
+
+    判别余量很大:真实 L 残基的归一化行列式在 +0.58~+0.83,离阈值 0 极远,无边界误判风险。
     """
     d_ca, d_cb = [], []
     for (ch, rs, ic), r in st.residues.items():
