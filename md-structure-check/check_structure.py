@@ -266,6 +266,8 @@ class Structure(object):
         self.dropped_altloc = 0          # 被过滤掉的次要构象原子数
         self.lost_atoms = 0              # 因链标识冲突被静默覆盖掉的原子数
         self.gro_split = 0               # .gro 按几何自动切出的链数
+        self.nonprotein = 0              # 被跳过的非蛋白原子数(水/膜/离子)
+        self.resseq_overflow = 0         # 残基号溢出到插入码列的原子数
         (self._read_gro if self.fmt == "gro" else self._read_pdb)()
         self.residues = self._group()
 
@@ -302,6 +304,13 @@ class Structure(object):
                 except ValueError:
                     a.resseq = -9999
                 a.icode = pad[26]
+                # >9999 个残基时,残基号会溢出到第 27 列(插入码列)。这是 PDB 的
+                # 固有限制,不是真的插入码 —— 大体系(几万个水分子)必然触发。
+                if a.icode.isdigit():
+                    try:
+                        a.resseq = int(pad[22:27]); a.icode = " "; self.resseq_overflow += 1
+                    except ValueError:
+                        pass
                 try:
                     a.xyz = (float(pad[30:38]), float(pad[38:46]), float(pad[46:54]))
                 except ValueError:
@@ -345,9 +354,15 @@ class Structure(object):
            73-76 列的 segid。只按 chain ID 分组会把多个原体**静默合并**成一条链 ——
            后写入的覆盖先写入的,大部分结构凭空消失,而且会伪造出满屏"重复原子"。
         """
-        SKIP = {"HOH", "WAT", "TIP3", "SOL", "DOD", "D2O",      # DOD = 重水(中子结构)
+        # ⚠️ 标准 PDB 的残基名只有 3 列(18-20),而脂质名多是 4 个字符 ——
+        #    CHARMM-GUI 写 PDB 时会把 POPC/POPE/POPS 全部截断成 "POP"。
+        #    只列全名会漏掉,整张膜被当成蛋白去查,产生上万条假的"编号不连续"。
+        SKIP = {"HOH", "WAT", "TIP3", "TIP", "SOL", "DOD", "D2O",   # DOD = 重水(中子结构)
                 "NA", "CL", "K", "POT", "CLA", "SOD", "MG", "ZN", "CA2",
-                "POPC", "POPE", "POPS", "POPG", "CHL1", "DPPC"}
+                "POPC", "POPE", "POPS", "POPG", "CHL1", "DPPC",
+                "POP", "DPP", "DOP", "DMP", "DLP", "CHL", "PSM", "SAP"}   # 3 字符截断形式
+        # CHARMM/CHARMM-GUI 给非蛋白组分的标准 segid,按 segid 跳更稳
+        SKIP_SEG = {"MEMB", "TIP3", "SOLV", "IONS", "WATA", "WATB", "HETA", "BULK"}
         def is_h(a):
             if a.element in ("H", "D"):
                 return True
@@ -364,7 +379,7 @@ class Structure(object):
         # 表面上只看到一处莫名其妙的"主链断裂"。
         alt_of = {}
         for a in self.atoms:
-            if a.resname in SKIP or is_h(a):
+            if a.resname in SKIP or a.segid in SKIP_SEG or is_h(a):
                 continue
             k = (chain_key(a), a.resseq, a.icode)
             cur = alt_of.get(k)
@@ -380,7 +395,8 @@ class Structure(object):
                     gro_chain += 1
                 prev = a.resseq
                 a.segid = "seg%d" % gro_chain if gro_chain else ""
-            if a.resname in SKIP:
+            if a.resname in SKIP or a.segid in SKIP_SEG:
+                self.nonprotein += 1
                 continue
             # 氘(D)也要滤掉:中子衍射结构用元素符号 D,只按 H 过滤会把它们当成
             # 重原子,制造成百上千的假"原子重叠"。
@@ -882,14 +898,29 @@ def check_format(st, rep):
     short    = [(i, l) for i, l in st.raw_lines
                 if l.startswith(("ATOM", "HETATM")) and len(l) < 78]
 
+    # 已组装的 MD 体系(蛋白 + 膜 + 水 + 离子)不会再拿去上传建库,MD 引擎读的是
+    # 拓扑文件而不是 PDB 的第 22 列。对这类文件把缺 chain ID 报成阻塞性问题是狼来了。
+    assembled = st.nonprotein > sum(len(r["atoms"]) for r in st.residues.values())
     if no_chain:
         segids = sorted(set(a.segid for a in no_chain if a.segid))
-        rep.add("C", "FAIL", "第 22 列 chain ID 为空 (%d 个原子)" % len(no_chain),
-                ("该文件是 CHARMM 风格:靠 73-76 列的 segid %s 标识链,但标准 PDB 解析器读第 22 列。\n"
-                 "    CHARMM-GUI 等工具会直接报 'expected chain ID at column 22' 拒绝上传。\n"
-                 "    修法:给每条链的第 22 列填一个字母。" % (segids or "(无)")))
+        if assembled:
+            rep.add("C", "WARN", "第 22 列 chain ID 为空 (%d 个原子)" % len(no_chain),
+                    "本文件已是组装好的体系(含膜/水/离子),靠 segid %s 区分组分。\n"
+                    "    MD 引擎读拓扑文件,不看第 22 列,所以**不影响运行**。\n"
+                    "    只有当你要把它再传给建库服务器时才需要补 chain ID。" % segids)
+        else:
+            rep.add("C", "FAIL", "第 22 列 chain ID 为空 (%d 个原子)" % len(no_chain),
+                    ("该文件是 CHARMM 风格:靠 73-76 列的 segid %s 标识链,但标准 PDB 解析器读第 22 列。\n"
+                     "    CHARMM-GUI 等工具会直接报 'expected chain ID at column 22' 拒绝上传。\n"
+                     "    修法:给每条链的第 22 列填一个字母。" % (segids or "(无)")))
     else:
         rep.add("C", "PASS", "chain ID 完整")
+
+    if st.resseq_overflow:
+        rep.add("C", "PASS", "残基号溢出到第 27 列 (%d 个原子),已按 5 位数解析"
+                % st.resseq_overflow,
+                "PDB 的残基号只有 4 列(23-26),超过 9999 就会挤进插入码列。\n"
+                "    大体系(几万个水分子)必然如此,不是错误,GROMACS/CHARMM 用的 .gro/.psf 无此限制。")
 
     if no_elem:
         rep.add("C", "WARN", "第 77-78 列元素符号缺失 (%d 个原子)" % len(no_elem),
