@@ -494,8 +494,15 @@ def check_ring_piercing(st, rep):
         for (p, q, tag, _bt) in bonds:
             if dist(c, p) > rad + 3.0 and dist(c, q) > rad + 3.0:
                 continue
+            # 环自身的边不算穿环。TRP 是并环(吲哚),五元环与六元环共用 CD2-CE2 —— 这条边
+            # 落在环平面内,而五元环边中点到环心约 0.81*rad,正好在下面 0.85*rad 的阈值内,
+            # 浮点噪声就会把它误判成穿环。
+            if id(p) in ids or id(q) in ids:
+                continue
             dp, dq = dot(sub(p, c), nv), dot(sub(q, c), nv)
             if dp * dq >= 0:                    # 两端同侧,没穿过平面
+                continue
+            if abs(dp) < 0.4 or abs(dq) < 0.4:  # 近乎共面 = 平面内的键,不是穿过
                 continue
             t = dp / (dp - dq)
             x = add(p, scale(sub(q, p), t))
