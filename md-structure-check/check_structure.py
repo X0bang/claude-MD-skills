@@ -345,7 +345,8 @@ class Structure(object):
            73-76 列的 segid。只按 chain ID 分组会把多个原体**静默合并**成一条链 ——
            后写入的覆盖先写入的,大部分结构凭空消失,而且会伪造出满屏"重复原子"。
         """
-        SKIP = {"HOH", "WAT", "TIP3", "SOL", "NA", "CL", "K", "POT", "CLA", "SOD",
+        SKIP = {"HOH", "WAT", "TIP3", "SOL", "DOD", "D2O",      # DOD = 重水(中子结构)
+                "NA", "CL", "K", "POT", "CLA", "SOD", "MG", "ZN", "CA2",
                 "POPC", "POPE", "POPS", "POPG", "CHL1", "DPPC"}
         def is_h(a):
             if a.element in ("H", "D"):
@@ -549,7 +550,7 @@ def check_cis_peptide(st, rep):
 
 def check_missing_atoms(st, rep):
     """A4 缺失重原子"""
-    missing, unknown = [], []
+    missing, missing_bb, unknown = [], [], []
     for (ch, rs, ic), r in st.residues.items():
         rn = std(r["name"])
         if rn not in TEMPLATES:
@@ -558,16 +559,27 @@ def check_missing_atoms(st, rep):
         want = set(BACKBONE) | set(TEMPLATES[rn][0])
         have = set(r["atoms"])
         lack = want - have
+        if lack & set(BACKBONE):
+            missing_bb.append("%s%d%s 缺 %s" % (ch.strip() or "-", rs, rn,
+                                               ",".join(sorted(lack & set(BACKBONE)))))
         # 注意:不要无条件丢弃 "O"。C 端的 OT1/O1 已由 ATOM_ALIASES 归一化成 O,
         # 所以这里缺 O 就是真的缺主链羰基氧 —— 那是 A 级问题(补出来的 O 方向由
         # φ/ψ 决定,可能完全错),必须报出来。
         if lack:
             missing.append("%s%d%s 缺 %s" % (ch.strip() or "-", rs, rn, ",".join(sorted(lack))))
+    if missing_bb:
+        rep.add("A", "FAIL", "缺失**主链**重原子:%d 个残基" % len(missing_bb),
+                "\n    ".join(missing_bb[:15]) + ("\n    ..." if len(missing_bb) > 15 else "") +
+                "\n    主链缺原子必须先修。补出来的羰基 O 方向由 φ/ψ 决定,可能完全错;\n"
+                "    缺 N/CA/C 则会被当成断链,建库时各自加端基。")
     if missing:
-        rep.add("A", "FAIL", "缺失重原子:%d 个残基" % len(missing),
+        # 侧链缺原子降为提示:晶体结构里表面残基侧链无电子密度很常见,
+        # 所有建库工具都会按 rotamer 库补回来,通常没问题 —— 但值得知道补了哪些。
+        rep.add("A", "WARN", "缺失侧链重原子:%d 个残基(建库工具会自动补)" % len(missing),
                 "\n    ".join(missing[:15]) + ("\n    ..." if len(missing) > 15 else "") +
-                "\n    建库工具通常会自动补,但补出来的位置未必合理;若缺主链原子必须先修。")
-    else:
+                "\n    多为晶体结构中无电子密度的柔性侧链。补出来的构象由工具的 rotamer 库决定,\n"
+                "    若这些残基位于你关心的界面/结合位点,建议人工确认。")
+    if not missing and not missing_bb:
         rep.add("A", "PASS", "重原子完整")
     if unknown:
         rep.add("A", "WARN", "非标准残基 %d 个" % len(unknown),
