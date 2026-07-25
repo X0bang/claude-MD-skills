@@ -99,8 +99,34 @@ CHARGE = {"ARG": +1, "LYS": +1, "ASP": -1, "GLU": -1, "HSP": +1, "HIP": +1}
 
 # 理想键长 (Å) 与容差
 IDEAL_BONDS = {("N", "CA"): 1.458, ("CA", "C"): 1.525, ("C", "O"): 1.231}
-IDEAL_SIDECHAIN = 1.52     # C-C 通用值;含 N/O/S 的键单独放宽
+IDEAL_SIDECHAIN = 1.52     # 通用 sp3 C-C
 BOND_TOL = 0.15
+
+# 侧链具体键长 —— 用通用 1.52 会把芳香环(1.39)和胍基/酰胺 C-N(1.33)全部误报。
+IDEAL_SC = {}
+def _sc(res, pairs, val):
+    for a, b in pairs:
+        IDEAL_SC[(res, frozenset((a, b)))] = val
+
+for _r in ("PHE", "TYR"):
+    _sc(_r, [("CG", "CD1"), ("CG", "CD2"), ("CD1", "CE1"), ("CD2", "CE2"),
+             ("CE1", "CZ"), ("CE2", "CZ")], 1.39)
+_sc("TYR", [("CZ", "OH")], 1.38)
+_sc("TRP", [("CG", "CD1")], 1.37); _sc("TRP", [("CG", "CD2")], 1.43)
+_sc("TRP", [("CD1", "NE1"), ("NE1", "CE2")], 1.37)
+_sc("TRP", [("CD2", "CE2"), ("CD2", "CE3"), ("CE2", "CZ2"),
+            ("CE3", "CZ3"), ("CZ2", "CH2"), ("CZ3", "CH2")], 1.40)
+_sc("HIS", [("CG", "ND1")], 1.38); _sc("HIS", [("CG", "CD2")], 1.35)
+_sc("HIS", [("ND1", "CE1"), ("CE1", "NE2")], 1.32); _sc("HIS", [("CD2", "NE2")], 1.37)
+_sc("ARG", [("CD", "NE")], 1.46); _sc("ARG", [("NE", "CZ"), ("CZ", "NH1"), ("CZ", "NH2")], 1.33)
+_sc("LYS", [("CE", "NZ")], 1.49)
+_sc("ASN", [("CG", "OD1")], 1.23); _sc("ASN", [("CG", "ND2")], 1.33)
+_sc("GLN", [("CD", "OE1")], 1.23); _sc("GLN", [("CD", "NE2")], 1.33)
+_sc("ASP", [("CG", "OD1"), ("CG", "OD2")], 1.25)
+_sc("GLU", [("CD", "OE1"), ("CD", "OE2")], 1.25)
+_sc("SER", [("CB", "OG")], 1.42); _sc("THR", [("CB", "OG1")], 1.43)
+_sc("CYS", [("CB", "SG")], 1.81)
+_sc("MET", [("CG", "SD"), ("SD", "CE")], 1.81)
 PEPTIDE_CN = 1.329
 CA_CA_TRANS = 3.80
 
@@ -438,7 +464,7 @@ def check_ring_piercing(st, rep):
     bonds = _bond_list(st)
     hits = []
     for (ch, rs, rn, c, nv, rad, ids, pts) in rings:
-        for (p, q, tag) in bonds:
+        for (p, q, tag, _bt) in bonds:
             if dist(c, p) > rad + 3.0 and dist(c, q) > rad + 3.0:
                 continue
             dp, dq = dot(sub(p, c), nv), dot(sub(q, c), nv)
@@ -491,27 +517,31 @@ def _bond_list(st):
             pairs = list(BB_BONDS) + list(TEMPLATES.get(rn, ([], []))[1])
             for a, b in pairs:
                 if a in at and b in at:
-                    out.append((at[a], at[b], "%s%d %s-%s" % (ch.strip() or "-", rs, a, b)))
+                    out.append((at[a], at[b],
+                                "%s%d%s %s-%s" % (ch.strip() or "-", rs, rn, a, b), (rn, a, b)))
             if i + 1 < len(lst):
                 nxt = lst[i + 1][1]["atoms"]
                 if "C" in at and "N" in nxt and dist(at["C"], nxt["N"]) < 2.0:
-                    out.append((at["C"], nxt["N"], "%s%d-%d C-N" % (ch.strip() or "-", rs, lst[i+1][0][1])))
+                    out.append((at["C"], nxt["N"],
+                                "%s%d-%d 肽键 C-N" % (ch.strip() or "-", rs, lst[i+1][0][1]),
+                                ("*PEP*", "C", "N")))
     return out
 
 
 def check_bond_lengths(st, rep):
     """B1 键长异常 —— 极小化能修,但会让建库工具报天文数字能量"""
     bad = []
-    for (p, q, tag) in _bond_list(st):
+    for (p, q, tag, (rn, a, b)) in _bond_list(st):
         d = dist(p, q)
-        if "C-N" in tag and "-" in tag.split()[0]:
-            ideal, tol = PEPTIDE_CN, 0.15
+        tol = BOND_TOL
+        if rn == "*PEP*":
+            ideal = PEPTIDE_CN
         else:
-            a, b = tag.split()[-1].split("-")
-            ideal = IDEAL_BONDS.get((a, b), IDEAL_BONDS.get((b, a)))
+            ideal = IDEAL_SC.get((rn, frozenset((a, b))))
             if ideal is None:
-                ideal = 1.81 if ("S" in a or "S" in b) else IDEAL_SIDECHAIN
-            tol = BOND_TOL
+                ideal = IDEAL_BONDS.get((a, b), IDEAL_BONDS.get((b, a)))
+            if ideal is None:
+                ideal = IDEAL_SIDECHAIN
         if abs(d - ideal) > tol:
             bad.append((abs(d - ideal), "%s = %.2f Å (应 %.2f)" % (tag, d, ideal)))
     if bad:
@@ -532,7 +562,7 @@ def check_clashes(st, rep):
             labels.append("%s%d%s:%s" % (ch.strip() or "-", rs, std(r["name"]), n))
     bonded = set()
     idx = {id(p): i for i, p in enumerate(pts)}
-    for (p, q, _) in _bond_list(st):
+    for (p, q, _t, _bt) in _bond_list(st):
         if id(p) in idx and id(q) in idx:
             bonded.add((min(idx[id(p)], idx[id(q)]), max(idx[id(p)], idx[id(q)])))
     # 1-3 邻居(共享一个成键原子)也排除
