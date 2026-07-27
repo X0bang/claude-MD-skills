@@ -7,6 +7,7 @@
 | Skill | 作用 |
 |---|---|
 | [`md-structure-check`](md-structure-check/) | 跑 MD 之前对蛋白质结构做体检,按"MD 修得好 / 修不好"分级报告。零依赖,纯 python3 标准库。 |
+| [`cg-md`](cg-md/) | MARTINI 3 粗粒化自发组装 MD 的完整工作流 + 避坑 + 结果解读(含 CG 强度排序不可信、须与原子级 PMF 交叉检验)。附零依赖建库前体检脚本 `cg_preflight.py`。 |
 
 ## 安装
 
